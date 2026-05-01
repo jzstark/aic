@@ -210,6 +210,71 @@ isaaclab -p aic/aic_utils/aic_isaac/aic_isaaclab/scripts/teleop.py \
 
 ## Phase 3：奖励函数修改（Day 2，约 3 小时）
 
+### 3.0 补充随机化：task board YAW
+
+**背景**：Phase 2 分析发现 Isaac Lab 的 `randomize_board_and_parts` 只随机化了 task board 的 XY 位置（±5mm），**没有随机化 YAW**。但 AIC 评测中 trial 1/2 的 yaw≈3.14 rad，trial 3 的 yaw≈3.0 rad，朝向明显不同。如果不加 YAW 随机化，训练出的策略无法泛化到 trial 3。
+
+**修改 `aic_task_env_cfg.py` 的 `EventCfg`**，将 `board_range` 改为：
+
+```python
+randomize_board_and_parts = EventTerm(
+    func=randomize_board_and_parts,
+    mode="reset",
+    params={
+        "board_scene_name": "task_board",
+        "board_default_pos": (0.2837, 0.229, 0.0),
+        "board_range": {
+            "x": (-0.005, 0.005),
+            "y": (-0.005, 0.005),
+            "yaw": (-0.15, 0.15),   # ← 新增：覆盖评测中 ±0.07 rad 的朝向变化
+        },
+        "parts": [ ... ],  # 保持不变
+    },
+)
+```
+
+**同时修改 `events.py` 的 `randomize_board_and_parts` 函数**，让它支持 `board_range` 中的 `yaw` 键，将随机 yaw delta 叠加到 board 的旋转四元数上：
+
+```python
+# 在 board_pos 随机化之后，yaw delta 叠加到 board_rot
+yaw_lo, yaw_hi = board_range.get("yaw", (0.0, 0.0))
+if yaw_hi != yaw_lo:
+    yaw_delta = torch.empty(n, device=device).uniform_(yaw_lo, yaw_hi)
+    # 将 yaw delta 转为四元数 (w, x, y, z)，绕 Z 轴旋转
+    half = yaw_delta / 2.0
+    dq = torch.stack([
+        torch.cos(half),          # w
+        torch.zeros(n, device=device),  # x
+        torch.zeros(n, device=device),  # y
+        torch.sin(half),          # z
+    ], dim=-1)  # (n, 4) in wxyz order
+    # 四元数乘法：board_rot_new = dq * board_rot_cached
+    board_rot = _quat_mul(dq, board_rot)  # 见下方辅助函数
+```
+
+在 `events.py` 末尾添加辅助函数：
+```python
+def _quat_mul(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+    """Hamilton product of two (N,4) wxyz quaternions."""
+    w1, x1, y1, z1 = q1.unbind(-1)
+    w2, x2, y2, z2 = q2.unbind(-1)
+    return torch.stack([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+    ], dim=-1)
+```
+
+> **注意**：parts（sc_port、nic_card 等）的 offset 是相对于 board 的局部坐标系的，
+> 所以加了 board YAW 随机化后，还需要把 part 的 offset 也按 board YAW 旋转，
+> 才能保证 part 始终在 board 上正确的位置。如果 `randomize_board_and_parts` 
+> 已经将 part 的世界位置算作 `board_world_pos + offset`（当前实现如此），
+> 则需要将 offset 先旋转到 board 朝向下再加，否则 parts 会偏离 board。
+>
+> 简化方案：**先跳过 YAW 随机化，仅在奖励工程通过 100 次迭代验证后再加**。
+> 观察 trial 3 的 sim-to-sim 表现再决定是否必要。
+
 ### 3.1 需要添加的奖励
 
 | 奖励项 | 类型 | weight | 目的 |
