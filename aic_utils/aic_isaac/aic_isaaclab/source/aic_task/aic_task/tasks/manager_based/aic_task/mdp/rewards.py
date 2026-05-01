@@ -184,3 +184,51 @@ def body_lin_acc_l2(
     return torch.sum(
         torch.norm(asset.data.body_lin_acc_w[:, asset_cfg.body_ids, :], dim=-1), dim=1
     )
+
+
+# ---------------------------------------------------------------------------
+# Port-targeting rewards for cable-insertion task
+# ---------------------------------------------------------------------------
+
+
+def dist_to_port(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg,
+    port_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """L2 distance from EE to port origin. Use with a negative weight."""
+    robot: Articulation = env.scene[robot_cfg.name]
+    port: RigidObject = env.scene[port_cfg.name]
+    ee_pos = robot.data.body_pos_w[:, robot_cfg.body_ids[0], :]
+    port_pos = port.data.root_pos_w[:, :3]
+    return torch.norm(ee_pos - port_pos, dim=1)
+
+
+def dist_to_port_tanh(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg,
+    port_cfg: SceneEntityCfg,
+    std: float = 0.05,
+) -> torch.Tensor:
+    """Tanh reward in [0, 1] that peaks at 1.0 when EE is on the port."""
+    robot: Articulation = env.scene[robot_cfg.name]
+    port: RigidObject = env.scene[port_cfg.name]
+    ee_pos = robot.data.body_pos_w[:, robot_cfg.body_ids[0], :]
+    port_pos = port.data.root_pos_w[:, :3]
+    dist = torch.norm(ee_pos - port_pos, dim=1)
+    return 1.0 - torch.tanh(dist / std)
+
+
+def insertion_success_bonus(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg,
+    port_cfg: SceneEntityCfg,
+    threshold: float = 0.01,
+) -> torch.Tensor:
+    """Sparse +1 when EE is within *threshold* metres of port origin."""
+    robot: Articulation = env.scene[robot_cfg.name]
+    port: RigidObject = env.scene[port_cfg.name]
+    ee_pos = robot.data.body_pos_w[:, robot_cfg.body_ids[0], :]
+    port_pos = port.data.root_pos_w[:, :3]
+    dist = torch.norm(ee_pos - port_pos, dim=1)
+    return (dist < threshold).float()

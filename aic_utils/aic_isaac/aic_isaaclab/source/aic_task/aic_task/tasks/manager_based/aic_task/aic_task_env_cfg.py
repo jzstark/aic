@@ -214,51 +214,29 @@ class AICTaskSceneCfg(InteractiveSceneCfg):
 
     def __post_init__(self):
         super().__post_init__()
-
-        _cam_spawn = sim_utils.PinholeCameraCfg(
-            focal_length=22.48,
-            focus_distance=0.0,
-            horizontal_aperture=20.955,
-            vertical_aperture=18.627,
-            clipping_range=(0.07, 20.0),
-        )
-
-        self.center_camera = TiledCameraCfg(
-            prim_path="{ENV_REGEX_NS}/Robot/aic_unified_robot/center_camera_optical/center_camera",
-            spawn=_cam_spawn,
-            height=224,
-            width=224,
-            data_types=["rgb"],
-            offset=TiledCameraCfg.OffsetCfg(
-                pos=(0.0, 0.0, 0.0),
-                rot=(1.0, 0.0, 0.0, 0.0),
-                convention="ros",
-            ),
-        )
-        self.left_camera = TiledCameraCfg(
-            prim_path="{ENV_REGEX_NS}/Robot/aic_unified_robot/left_camera_optical/left_camera",
-            spawn=_cam_spawn,
-            height=224,
-            width=224,
-            data_types=["rgb"],
-            offset=TiledCameraCfg.OffsetCfg(
-                pos=(0.0, 0.0, 0.0),
-                rot=(1.0, 0.0, 0.0, 0.0),
-                convention="ros",
-            ),
-        )
-        self.right_camera = TiledCameraCfg(
-            prim_path="{ENV_REGEX_NS}/Robot/aic_unified_robot/right_camera_optical/right_camera",
-            spawn=_cam_spawn,
-            height=224,
-            width=224,
-            data_types=["rgb"],
-            offset=TiledCameraCfg.OffsetCfg(
-                pos=(0.0, 0.0, 0.0),
-                rot=(1.0, 0.0, 0.0, 0.0),
-                convention="ros",
-            ),
-        )
+        # Cameras are disabled for headless RL training.
+        # To re-enable, uncomment the blocks below and add --enable_cameras to the train command.
+        #
+        # _cam_spawn = sim_utils.PinholeCameraCfg(
+        #     focal_length=22.48, focus_distance=0.0,
+        #     horizontal_aperture=20.955, vertical_aperture=18.627,
+        #     clipping_range=(0.07, 20.0),
+        # )
+        # self.center_camera = TiledCameraCfg(
+        #     prim_path="{ENV_REGEX_NS}/Robot/aic_unified_robot/center_camera_optical/center_camera",
+        #     spawn=_cam_spawn, height=224, width=224, data_types=["rgb"],
+        #     offset=TiledCameraCfg.OffsetCfg(pos=(0,0,0), rot=(1,0,0,0), convention="ros"),
+        # )
+        # self.left_camera = TiledCameraCfg(
+        #     prim_path="{ENV_REGEX_NS}/Robot/aic_unified_robot/left_camera_optical/left_camera",
+        #     spawn=_cam_spawn, height=224, width=224, data_types=["rgb"],
+        #     offset=TiledCameraCfg.OffsetCfg(pos=(0,0,0), rot=(1,0,0,0), convention="ros"),
+        # )
+        # self.right_camera = TiledCameraCfg(
+        #     prim_path="{ENV_REGEX_NS}/Robot/aic_unified_robot/right_camera_optical/right_camera",
+        #     spawn=_cam_spawn, height=224, width=224, data_types=["rgb"],
+        #     offset=TiledCameraCfg.OffsetCfg(pos=(0,0,0), rot=(1,0,0,0), convention="ros"),
+        # )
 
 
 ##
@@ -372,7 +350,10 @@ class ObservationsCfg:
 
     @configclass
     class PolicyCfg(ObsGroup):
-        """Observations for policy: joint state, ee pose, pose command."""
+        """Observations for policy: joint state, ee pose, port-relative pos, last action.
+
+        Total dims: joint_pos(6) + joint_vel(6) + eef_pose(7) + port_rel(3) + actions(6) = 28
+        """
 
         # Robot state (joint space)
         joint_pos = ObsTerm(
@@ -381,62 +362,20 @@ class ObservationsCfg:
         joint_vel = ObsTerm(
             func=mdp.joint_vel_rel, noise=Unoise(n_min=-0.01, n_max=0.01)
         )
-        # End-effector pose in env frame (pos xyz + quat wxyz = 7 dims)
+        # End-effector pose in world frame (pos xyz + quat wxyz = 7 dims)
         eef_pose = ObsTerm(
             func=mdp.body_pose_w,
             params={"asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link")},
             noise=Unoise(n_min=-0.001, n_max=0.001),
         )
-        # Command (target ee pose)
-        pose_command = ObsTerm(
-            func=mdp.generated_commands, params={"command_name": "ee_pose"}
-        )
-
-        # Body forces
-        body_forces = ObsTerm(
-            func=mdp.body_incoming_wrench,
-            scale=0.1,
+        # Port position relative to EE (3 dims); ground-truth, no noise during training
+        port_rel = ObsTerm(
+            func=mdp.port_relative_to_ee,
             params={
-                "asset_cfg": SceneEntityCfg(
-                    "robot",
-                    body_names=[
-                        "base_link",
-                        "shoulder_link",
-                        "upper_arm_link",
-                        "forearm_link",
-                        "wrist_1_link",
-                        "wrist_2_link",
-                        "wrist_3_link",
-                    ],
-                )
+                "robot_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "port_cfg": SceneEntityCfg("nic_card"),
             },
         )
-
-        center_rgb = ObsTerm(
-            func=mdp.image_features,
-            params={
-                "sensor_cfg": SceneEntityCfg("center_camera"),
-                "data_type": "rgb",
-                "model_name": "resnet18",
-            },
-        )
-        left_rgb = ObsTerm(
-            func=mdp.image_features,
-            params={
-                "sensor_cfg": SceneEntityCfg("left_camera"),
-                "data_type": "rgb",
-                "model_name": "resnet18",
-            },
-        )
-        right_rgb = ObsTerm(
-            func=mdp.image_features,
-            params={
-                "sensor_cfg": SceneEntityCfg("right_camera"),
-                "data_type": "rgb",
-                "model_name": "resnet18",
-            },
-        )
-
         # Last action
         actions = ObsTerm(func=mdp.last_action)
 
@@ -452,64 +391,31 @@ class ObservationsCfg:
 class RewardsCfg:
     """Reward terms for the MDP."""
 
-    # -- Position tracking (coarse): L2 penalty drives the EE toward the target --
-    end_effector_position_tracking = RewTerm(
-        func=mdp.position_command_error,
-        weight=-0.2,
+    # -- Port-targeting rewards --
+    dist_to_sfp = RewTerm(
+        func=mdp.dist_to_port,
+        weight=-0.5,
         params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
-            "command_name": "ee_pose",
+            "robot_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+            "port_cfg": SceneEntityCfg("nic_card"),
         },
     )
-    # -- Position tracking (fine): tanh kernel provides dense signal near target --
-    end_effector_position_tracking_fine_grained = RewTerm(
-        func=mdp.position_command_error_tanh,
-        weight=0.1,
+    dist_to_sfp_tanh = RewTerm(
+        func=mdp.dist_to_port_tanh,
+        weight=2.0,
         params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
-            "std": 0.1,
-            "command_name": "ee_pose",
+            "robot_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+            "port_cfg": SceneEntityCfg("nic_card"),
+            "std": 0.05,
         },
     )
-    # -- Position tracking (exponential): sharp bonus at very close range for insertion --
-    end_effector_position_tracking_exp = RewTerm(
-        func=mdp.position_command_error_exp,
-        weight=0.3,
+    insertion_success = RewTerm(
+        func=mdp.insertion_success_bonus,
+        weight=10.0,
         params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
-            "sigma": 0.05,
-            "command_name": "ee_pose",
-        },
-    )
-
-    # -- Orientation tracking (coarse): angular-distance penalty --
-    end_effector_orientation_tracking = RewTerm(
-        func=mdp.orientation_command_error,
-        weight=-0.1,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
-            "command_name": "ee_pose",
-        },
-    )
-    # -- Orientation tracking (fine): tanh kernel for precise alignment --
-    end_effector_orientation_tracking_fine_grained = RewTerm(
-        func=mdp.orientation_command_error_tanh,
-        weight=0.05,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
-            "std": 0.25,
-            "command_name": "ee_pose",
-        },
-    )
-
-    # -- Sparse reaching bonus: +1 when EE is within 2 cm of the target --
-    reaching_bonus = RewTerm(
-        func=mdp.ee_reaching_bonus,
-        weight=1.0,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
-            "threshold": 0.02,
-            "command_name": "ee_pose",
+            "robot_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+            "port_cfg": SceneEntityCfg("nic_card"),
+            "threshold": 0.01,
         },
     )
 
@@ -569,25 +475,6 @@ class AICTaskEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.dt = 1.0 / 120.0
         # self.sim.gravity = (0.0, 0.0, 3)
         self.viewer.eye = (8.0, 0.0, 5.0)
-
-        # Override reward/command body to UR end-effector
-        ee_body = ["wrist_3_link"]
-        self.rewards.end_effector_position_tracking.params["asset_cfg"].body_names = (
-            ee_body
-        )
-        self.rewards.end_effector_position_tracking_fine_grained.params[
-            "asset_cfg"
-        ].body_names = ee_body
-        self.rewards.end_effector_position_tracking_exp.params[
-            "asset_cfg"
-        ].body_names = ee_body
-        self.rewards.end_effector_orientation_tracking.params[
-            "asset_cfg"
-        ].body_names = ee_body
-        self.rewards.end_effector_orientation_tracking_fine_grained.params[
-            "asset_cfg"
-        ].body_names = ee_body
-        self.rewards.reaching_bonus.params["asset_cfg"].body_names = ee_body
 
         # # Arm action: joint position control
         # self.actions.arm_action = JointPositionActionCfg(

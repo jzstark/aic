@@ -23,7 +23,10 @@ from isaaclab.envs.mdp import *  # noqa: F401, F403
 from .observations import *  # noqa: F401, F403
 from .rewards import (  # noqa: F401
     body_lin_acc_l2,
+    dist_to_port,
+    dist_to_port_tanh,
     ee_reaching_bonus,
+    insertion_success_bonus,
     joint_acc_l2,
     joint_pos_limits,
     joint_torques_l2,
