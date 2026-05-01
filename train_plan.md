@@ -210,52 +210,17 @@ isaaclab -p aic/aic_utils/aic_isaac/aic_isaaclab/scripts/teleop.py \
 
 ## Phase 3：奖励函数修改（Day 2，约 3 小时）
 
-### 3.0 补充随机化：task board YAW
+### 3.0 补充随机化：task board YAW（✅ 已实现）
 
-**背景**：Phase 2 分析发现 Isaac Lab 的 `randomize_board_and_parts` 只随机化了 task board 的 XY 位置（±5mm），**没有随机化 YAW**。但 AIC 评测中 trial 1/2 的 yaw≈3.14 rad，trial 3 的 yaw≈3.0 rad，朝向明显不同。如果不加 YAW 随机化，训练出的策略无法泛化到 trial 3。
+**背景**：Phase 2 分析发现 `randomize_board_and_parts` 只随机化了 task board 的 XY 位置（±5mm），**没有随机化 YAW**。但 AIC 评测中 trial 1/2 的 yaw≈3.14 rad，trial 3 的 yaw≈3.0 rad，朝向明显不同，不加 YAW 随机化则策略无法泛化到 trial 3。
 
-**修改 `aic_task_env_cfg.py` 的 `EventCfg`**，将 `board_range` 改为：
+**已完成的改动：**
 
-```python
-randomize_board_and_parts = EventTerm(
-    func=randomize_board_and_parts,
-    mode="reset",
-    params={
-        "board_scene_name": "task_board",
-        "board_default_pos": (0.2837, 0.229, 0.0),
-        "board_range": {
-            "x": (-0.005, 0.005),
-            "y": (-0.005, 0.005),
-            "yaw": (-0.15, 0.15),   # ← 新增：覆盖评测中 ±0.07 rad 的朝向变化
-        },
-        "parts": [ ... ],  # 保持不变
-    },
-)
-```
-
-**同时修改 `events.py` 的 `randomize_board_and_parts` 函数**，让它支持 `board_range` 中的 `yaw` 键，将随机 yaw delta 叠加到 board 的旋转四元数上：
+**`events.py`** — 在模块顶部（`_sample_axis` 之前）新增辅助函数，并扩展 `randomize_board_and_parts` 函数：
 
 ```python
-# 在 board_pos 随机化之后，yaw delta 叠加到 board_rot
-yaw_lo, yaw_hi = board_range.get("yaw", (0.0, 0.0))
-if yaw_hi != yaw_lo:
-    yaw_delta = torch.empty(n, device=device).uniform_(yaw_lo, yaw_hi)
-    # 将 yaw delta 转为四元数 (w, x, y, z)，绕 Z 轴旋转
-    half = yaw_delta / 2.0
-    dq = torch.stack([
-        torch.cos(half),          # w
-        torch.zeros(n, device=device),  # x
-        torch.zeros(n, device=device),  # y
-        torch.sin(half),          # z
-    ], dim=-1)  # (n, 4) in wxyz order
-    # 四元数乘法：board_rot_new = dq * board_rot_cached
-    board_rot = _quat_mul(dq, board_rot)  # 见下方辅助函数
-```
-
-在 `events.py` 末尾添加辅助函数：
-```python
+# 新增：wxyz 四元数 Hamilton 乘积
 def _quat_mul(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
-    """Hamilton product of two (N,4) wxyz quaternions."""
     w1, x1, y1, z1 = q1.unbind(-1)
     w2, x2, y2, z2 = q2.unbind(-1)
     return torch.stack([
@@ -266,14 +231,49 @@ def _quat_mul(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
     ], dim=-1)
 ```
 
-> **注意**：parts（sc_port、nic_card 等）的 offset 是相对于 board 的局部坐标系的，
-> 所以加了 board YAW 随机化后，还需要把 part 的 offset 也按 board YAW 旋转，
-> 才能保证 part 始终在 board 上正确的位置。如果 `randomize_board_and_parts` 
-> 已经将 part 的世界位置算作 `board_world_pos + offset`（当前实现如此），
-> 则需要将 offset 先旋转到 board 朝向下再加，否则 parts 会偏离 board。
->
-> 简化方案：**先跳过 YAW 随机化，仅在奖励工程通过 100 次迭代验证后再加**。
-> 观察 trial 3 的 sim-to-sim 表现再决定是否必要。
+在 `randomize_board_and_parts` 的 XY 随机化之后，board 写入 sim 之前插入：
+
+```python
+# YAW 随机化（board_range 无 "yaw" 键时自动跳过，lo==hi 时不做任何事）
+yaw_lo, yaw_hi = board_range.get("yaw", (0.0, 0.0))
+if yaw_hi != yaw_lo:
+    yaw_delta = torch.empty(n, device=device).uniform_(yaw_lo, yaw_hi)
+    half = yaw_delta * 0.5
+    zeros = torch.zeros(n, device=device)
+    dq = torch.stack([torch.cos(half), zeros, zeros, torch.sin(half)], dim=-1)
+    board_rot = _quat_mul(dq, board_rot)
+```
+
+Parts 的 XY offset 也随 board yaw 同步旋转（保证 NIC 卡等零件在 board 转动后仍在正确位置）：
+
+```python
+# 在每个 part 的 offset 计算中替换原来的逐 idx 累加写法
+local_offsets = torch.zeros(n, 3, device=device)
+for idx in range(n):
+    local_offsets[idx, 0] = ox + _sample_axis(pr, snap, "x")
+    local_offsets[idx, 1] = oy + _sample_axis(pr, snap, "y")
+    local_offsets[idx, 2] = oz
+
+if yaw_hi != yaw_lo:
+    cos_y = torch.cos(yaw_delta)
+    sin_y = torch.sin(yaw_delta)
+    rx = cos_y * local_offsets[:, 0] - sin_y * local_offsets[:, 1]
+    ry = sin_y * local_offsets[:, 0] + cos_y * local_offsets[:, 1]
+    local_offsets[:, 0] = rx
+    local_offsets[:, 1] = ry
+
+part_pos = board_world_pos.clone() + local_offsets
+```
+
+**`aic_task_env_cfg.py`** — `board_range` 已加入 `"yaw"` 键：
+
+```python
+"board_range": {"x": (-0.005, 0.005), "y": (-0.005, 0.005), "yaw": (-0.15, 0.15)},
+```
+
+> **如需暂时禁用 YAW 随机化**（例如先跑 100 次迭代验证奖励代码）：
+> 只需将 `aic_task_env_cfg.py` 里的 `"yaw": (-0.15, 0.15)` 删掉即可，
+> `events.py` 不需要改动——`yaw` 键不存在时 `lo==hi==0.0`，整个随机化逻辑自动跳过。
 
 ### 3.1 需要添加的奖励
 

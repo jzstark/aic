@@ -51,6 +51,18 @@ def randomize_dome_light(
     light.GetColorAttr().Set(Gf.Vec3f(r, g, b))
 
 
+def _quat_mul(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+    """Hamilton product for wxyz quaternions. Both inputs: (N, 4)."""
+    w1, x1, y1, z1 = q1.unbind(-1)
+    w2, x2, y2, z2 = q2.unbind(-1)
+    return torch.stack([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+    ], dim=-1)
+
+
 def _sample_axis(pose_range: dict, snap_step: dict, axis: str) -> float:
     """Sample an axis offset, snapping to a grid step when configured."""
     lo, hi = pose_range.get(axis, (0.0, 0.0))
@@ -146,6 +158,15 @@ def randomize_board_and_parts(
     )
     board_world_pos = board_pos + env_origins
 
+    # Apply yaw randomization (rotation around world Z axis) to the cached orientation.
+    yaw_lo, yaw_hi = board_range.get("yaw", (0.0, 0.0))
+    if yaw_hi != yaw_lo:
+        yaw_delta = torch.empty(n, device=device).uniform_(yaw_lo, yaw_hi)
+        half = yaw_delta * 0.5
+        zeros = torch.zeros(n, device=device)
+        dq = torch.stack([torch.cos(half), zeros, zeros, torch.sin(half)], dim=-1)
+        board_rot = _quat_mul(dq, board_rot)
+
     board_asset.write_root_pose_to_sim(
         torch.cat([board_world_pos, board_rot], dim=-1), env_ids=env_ids
     )
@@ -172,11 +193,24 @@ def randomize_board_and_parts(
         pr = part_cfg.get("pose_range", {})
         snap = part_cfg.get("snap_step", {})
 
-        part_pos = board_world_pos.clone()
+        # Build per-env local offsets (ox, oy, oz) plus random delta.
+        local_offsets = torch.zeros(n, 3, device=device)
         for idx in range(n):
-            part_pos[idx, 0] += ox + _sample_axis(pr, snap, "x")
-            part_pos[idx, 1] += oy + _sample_axis(pr, snap, "y")
-            part_pos[idx, 2] = board_world_pos[idx, 2] + oz
+            local_offsets[idx, 0] = ox + _sample_axis(pr, snap, "x")
+            local_offsets[idx, 1] = oy + _sample_axis(pr, snap, "y")
+            local_offsets[idx, 2] = oz
+
+        # Rotate XY offsets by the board yaw so parts stay attached after rotation.
+        if yaw_hi != yaw_lo:
+            cos_y = torch.cos(yaw_delta)
+            sin_y = torch.sin(yaw_delta)
+            rx = cos_y * local_offsets[:, 0] - sin_y * local_offsets[:, 1]
+            ry = sin_y * local_offsets[:, 0] + cos_y * local_offsets[:, 1]
+            local_offsets[:, 0] = rx
+            local_offsets[:, 1] = ry
+
+        part_pos = board_world_pos.clone() + local_offsets
+        part_pos[:, 2] = board_world_pos[:, 2] + local_offsets[:, 2]
 
         part_asset.write_root_pose_to_sim(
             torch.cat([part_pos, part_rot], dim=-1), env_ids=env_ids

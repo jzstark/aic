@@ -336,7 +336,7 @@ class EventCfg:
         params={
             "board_scene_name": "task_board",
             "board_default_pos": (0.2837, 0.229, 0.0),
-            "board_range": {"x": (-0.005, 0.005), "y": (-0.005, 0.005)},
+            "board_range": {"x": (-0.005, 0.005), "y": (-0.005, 0.005), "yaw": (-0.15, 0.15)},
             "parts": [
                 {
                     "scene_name": "sc_port",
