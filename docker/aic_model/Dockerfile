@@ -11,6 +11,8 @@ COPY aic_interfaces /ws_aic/src/aic/aic_interfaces
 COPY aic_utils /ws_aic/src/aic/aic_utils
 COPY pixi.toml pixi.lock /ws_aic/src/aic/
 COPY pixi_env_setup.sh /ws_aic/src/aic/
+# Add my own policy
+COPY my_policy_node /ws_aic/src/aic/my_policy_node
 
 # Add other dependencies
 
@@ -57,4 +59,5 @@ exec pixi run --as-is ros2 run aic_model aic_model "$@"
 EOF
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["--ros-args", "-p", "policy:=aic_example_policies.ros.CheatCode", "-p", "use_sim_time:=true"]
+# TODO:update the policy and parameters as needed
+CMD ["--ros-args", "-p", "policy:=my_policy_node.WaveArm", "-p", "use_sim_time:=true"]
