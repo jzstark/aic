@@ -14,15 +14,15 @@ from isaaclab_rl.rsl_rl import (
 
 @configclass
 class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env = 24
+    num_steps_per_env = 128
     max_iterations = 1500
     save_interval = 50
     experiment_name = "aic_task"
     empirical_normalization = False
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
-        actor_obs_normalization=False,
-        critic_obs_normalization=False,
+        actor_obs_normalization=True,
+        critic_obs_normalization=True,
         actor_hidden_dims=[512, 256, 128],
         critic_hidden_dims=[512, 256, 128],
         activation="elu",

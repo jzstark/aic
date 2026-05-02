@@ -392,21 +392,22 @@ class RewardsCfg:
     """Reward terms for the MDP."""
 
     # -- Port-targeting rewards --
+    # Linear penalty: always provides gradient toward port
     dist_to_sfp = RewTerm(
         func=mdp.dist_to_port,
-        weight=-0.5,
+        weight=-2.0,
         params={
             "robot_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
             "port_cfg": SceneEntityCfg("nic_card"),
         },
     )
-    dist_to_sfp_tanh = RewTerm(
-        func=mdp.dist_to_port_tanh,
-        weight=2.0,
+    # Exp shaping: peaks at 1.0 when EE is on port, active within ~0.3m
+    dist_to_sfp_exp = RewTerm(
+        func=mdp.dist_to_port_exp,
+        weight=5.0,
         params={
             "robot_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
             "port_cfg": SceneEntityCfg("nic_card"),
-            "std": 0.05,
         },
     )
     insertion_success = RewTerm(
@@ -415,7 +416,6 @@ class RewardsCfg:
         params={
             "robot_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
             "port_cfg": SceneEntityCfg("nic_card"),
-            "threshold": 0.01,
         },
     )
 
@@ -471,7 +471,7 @@ class AICTaskEnvCfg(ManagerBasedRLEnvCfg):
         # General settings
         self.decimation = 4
         self.sim.render_interval = self.decimation
-        self.episode_length_s = 200.0
+        self.episode_length_s = 10.0
         self.sim.dt = 1.0 / 120.0
         # self.sim.gravity = (0.0, 0.0, 3)
         self.viewer.eye = (8.0, 0.0, 5.0)

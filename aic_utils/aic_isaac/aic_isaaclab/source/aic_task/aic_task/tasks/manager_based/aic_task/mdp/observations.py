@@ -57,12 +57,14 @@ def port_relative_to_ee(
     env: ManagerBasedRLEnv,
     robot_cfg: SceneEntityCfg,
     port_cfg: SceneEntityCfg,
+    ee_body_name: str = "wrist_3_link",
 ) -> torch.Tensor:
     """Port world position minus EE world position. Shape: (N, 3)."""
     from isaaclab.assets import Articulation, RigidObject
 
     robot: Articulation = env.scene[robot_cfg.name]
     port: RigidObject = env.scene[port_cfg.name]
-    ee_pos = robot.data.body_pos_w[:, robot_cfg.body_ids[0], :]
+    ee_idx = robot.find_bodies(ee_body_name)[0][0]
+    ee_pos = robot.data.body_pos_w[:, ee_idx, :]
     port_pos = port.data.root_pos_w[:, :3]
     return port_pos - ee_pos

@@ -436,7 +436,7 @@ joint_pos(6) + joint_vel(6) + eef_pose(7) + port_rel(3) + last_action(6) = 28 �
 # 容器内
 isaaclab -p aic/aic_utils/aic_isaac/aic_isaaclab/scripts/rsl_rl/train.py \
     --task AIC-Task-v0 \
-    --num_envs 4 \
+    --num_envs 16 \
     --headless \
     --max_iterations 100
 ```
@@ -445,6 +445,45 @@ isaaclab -p aic/aic_utils/aic_isaac/aic_isaaclab/scripts/rsl_rl/train.py \
 - 没有报错 → 奖励/观测函数代码正确
 - `mean_reward` 在前 50 次有上升趋势（哪怕从负值上升）→ 策略在学习
 - 日志在：`logs/rsl_rl/aic_task/<timestamp>/`
+
+
+你现在运行的是 PPO 强化学习，可以想象成这样一个场景：
+
+16 个虚拟房间，每个房间里有一条机械臂和一块任务板。每个房间每 10 秒重置一次（任务板位置随机偏移 ±5mm，随机旋转 ±8.6°）。机械臂每 1/30 秒做一次动作，然后根据结果拿到"评分"。一个神经网络控制所有 16 条手臂，每 128 步统一学习一次。
+
+每一"轮"发生了什么（一次 iteration）
+
+┌────────────────────────────────────────────────────────────────┐
+│  16 个环境 × 128 步 = 2048 条数据                                 
+│                                                                 
+│  每步：                                                          
+│  1. 读取观测（28维）                                              
+│     joint_pos(6) + joint_vel(6) + eef_pose(7)                  
+│     + port_rel(3) + last_action(6)                             
+│                                                                 
+│  2. 神经网络输出动作（6维 = EE delta pos + delta rot）          
+│                                                                 
+│  3. DifferentialIK 把 delta-pose 转成关节速度                  
+│                                                                 
+│  4. 物理引擎运行 4 个 sim 步（1/120s × 4 = 1/30s）            
+│                                                                 
+│  5. 计算奖励：                                                  
+│     dist_to_sfp     = −2 × ‖EE − NIC卡‖      ← 线性惩罚      
+│     dist_to_sfp_exp = 5 × exp(−dist/0.15)    ← 指数奖励      
+│     joint_acc       = 惩罚抖动                                  
+└─────────────────────────┬──────────────────────────────────────┘
+                          │ 2048 条 (观测, 动作, 奖励, 下一观测)
+                          ▼
+┌────────────────────────────────────────────────────────────────┐
+│  PPO 更新（重复 8 次）                                         
+│                                                                 
+│  1. 价值函数估计每个状态的"期望总回报"                         
+│  2. 计算优势（这次实际拿到的奖励 比 预期 好多少？）            
+│  3. 梯度上升：调整网络权重，让好动作概率升高                   
+│  4. Clip 约束：单次更新幅度不超过 20%（PPO 的关键机制）       
+└────────────────────────────────────────────────────────────────┘
+
+
 
 ### 4.2 正式训练（过夜，建议用 tmux）
 
@@ -631,3 +670,148 @@ pixi run ros2 run aic_model aic_model --ros-args \
 | `my_policy_node/my_policy_node/RLPolicy.py` | 新建：加载 checkpoint，包装成 AIC Policy |
 | `my_policy_node/my_policy_node/checkpoints/model_best.pt` | 从 Isaac Lab 容器拷出的 checkpoint |
 | `docker/aic_model/Dockerfile` | 更新 CMD 和 COPY checkpoints |
+
+---
+
+## Debug 踩坑记录（Phase 3/4 实际遇到的问题）
+
+> 以下是实际训练过程中遇到的 7 个坑，每个坑附有根因分析和解决方案，供之后遇到类似问题时参考。
+
+---
+
+### 坑 1：相机报错，但问题不在 ObservationsCfg
+
+**症状**：
+```
+RuntimeError: A camera was spawned without the --enable_cameras flag.
+```
+训练启动即崩溃，即使已经把所有相机 `ObsTerm` 从 `PolicyCfg` 里删掉了。
+
+**根因**：
+Isaac Lab 的 `TiledCameraCfg` 是在 `AICTaskSceneCfg.__post_init__` 里用 `self.center_rgb = TiledCameraCfg(...)` 等语句**创建并注册**到 Scene 的。只删掉 `ObservationsCfg` 里的 `ObsTerm` 不会阻止相机资产被创建——Scene 里仍然存在这三个相机对象，Isaac Sim 看到就会报错。
+
+**解决方案**：
+在 `aic_task_env_cfg.py` 的 `AICTaskSceneCfg.__post_init__` 里，把三行相机创建代码注释掉：
+```python
+# self.center_rgb = TiledCameraCfg(...)
+# self.left_rgb = TiledCameraCfg(...)
+# self.right_rgb = TiledCameraCfg(...)
+```
+**规律**：Isaac Lab 中"不用某个 Scene 资产"的正确做法是不创建该资产（注释掉 `__post_init__` 里的赋值语句），而不是只删 Obs/Reward term。
+
+---
+
+### 坑 2：奖励函数静默返回 0（`SceneEntityCfg.body_ids` 的陷阱）
+
+**症状**：
+训练日志里 `Episode_Reward/dist_to_sfp` 等所有自定义奖励项均为 0.0，`mean_reward` 只由平滑惩罚项驱动，固定在 -0.13 附近，没有任何梯度信号。
+
+**根因**：
+Isaac Lab 的 `RewardManager` 在调用每个奖励函数时会 `try/except` 捕获所有异常并静默返回 0。当奖励函数里写了 `asset_cfg.body_ids[0]`，而 `SceneEntityCfg` 的 `body_ids` 在没有经过 `resolve()` 时默认为 `slice(None)`，`slice(None)[0]` 会抛出 `TypeError`，被静默吞掉，函数返回 0。
+
+**解决方案**：
+不使用 `body_ids[0]`，改为用 `find_bodies` 直接查询，并在模块级别缓存索引：
+```python
+_ee_body_idx: dict[str, int] = {}
+
+def _get_ee_pos(robot: Articulation, body_name: str) -> torch.Tensor:
+    if body_name not in _ee_body_idx:
+        idx, _ = robot.find_bodies(body_name)
+        _ee_body_idx[body_name] = idx[0]
+    return robot.data.body_pos_w[:, _ee_body_idx[body_name], :]
+```
+`observations.py` 里的 `port_relative_to_ee` 也同理，直接用 `robot.find_bodies(ee_body_name)[0][0]` 而不依赖 `body_ids`。
+
+**规律**：在自定义奖励/观测函数中，**永远不要用 `asset_cfg.body_ids[0]`**；用 `articulation.find_bodies("body_name")[0][0]` 代替，加模块级缓存避免每步重复查找。
+
+---
+
+### 坑 3：`RewTerm.params` 里的 float 参数可能无效
+
+**症状**：
+把 `dist_to_port_tanh` 加入 `RewardsCfg` 时，在 `params` 里传了 `"std": 0.25`，但奖励的行为跟 `std=0.05`（函数默认值）几乎一样——`tanh(0.26/0.25)≈0.89` 应有明显梯度，实测奖励接近 0。
+
+**根因**（推测）：
+Isaac Lab 的 `RewTerm` 参数分发逻辑对 `SceneEntityCfg` 对象有特殊处理（resolve、传 env 等）。当 `params` 字典里同时存在 `SceneEntityCfg` 和普通 float 时，float 参数可能不被正确转发，函数拿到的是默认值而非配置值。此行为没有报错，极难调试。
+
+**解决方案**：
+将需要 float 参数的奖励函数改为"无外部 float 配置"版本——把参数硬编码在函数体内，或采用不需要配置参数的数学形式。具体：
+- `dist_to_port_exp`（`exp(-dist/0.15)`）完全不依赖外部 float，替换 `dist_to_port_tanh`
+- 若确实需要可调参数，可以用不同 `sigma` 值各写一个独立函数（冗余但可靠）
+
+**规律**：**在 `RewTerm.params` 里，只可靠传递 `SceneEntityCfg` 和 `str` 类型参数；普通 float 参数不可信，改为硬编码在函数内。**
+
+---
+
+### 坑 4：前 40 次迭代奖励完全不变——观测归一化预热
+
+**症状**：
+训练前 40 次迭代，所有 `Episode_Reward/X` 固定不变，`episode_length` 只有 9 步，`mean_reward` 也固定。第 41 次之后突然跳变到另一组固定值，`episode_length` 跳到 510 步。整个过程没有任何梯度上升。
+
+**根因**：
+`rsl_rl_ppo_cfg.py` 中设置了 `actor_obs_normalization=True` 和 `critic_obs_normalization=True`。归一化模块在初始阶段的 running mean/var 全为 0，对输入的缩放极端不稳定。前 ~40 次迭代网络输出的动作是大噪声，导致机械臂在物理引擎里崩溃，每个 episode 只有 9 步就结束（终止条件被触发）。约 40 次迭代后 running stats 稳定，动作恢复正常，episode 长度回到正常范围。
+
+**这是正常行为，不是 bug**。只要之后奖励有上升趋势，不需要处理。
+
+**规律**：开启 obs normalization 后，前 40-50 次迭代的数据不可靠；看训练是否健康，要从第 50 次迭代之后的趋势判断。
+
+---
+
+### 坑 5：解读训练日志的两个奖励数字
+
+训练日志中同时出现两种奖励数字，含义不同：
+
+| 字段 | 含义 | 如何看 |
+|------|------|--------|
+| `mean_reward` | 整个 rollout buffer 里所有 transition 的总奖励均值（每 step 平均值 × 很多步） | 绝对值大，负数正常 |
+| `Episode_Reward/X` | **已完成 episode** 中，term X 每步平均值（只统计本次 rollout 里结束的 episode） | 绝对值小，用来诊断各项 |
+
+**如何换算**：
+- `dist_to_sfp_exp` 理论值：`weight × exp(-dist/0.15)`，EE 在 0.15m 处 = `5 × exp(-1) ≈ 1.84`
+- 如果 `Episode_Reward/dist_to_sfp_exp` 从 0.009 涨到 1.8，对应 EE 从 ~25cm 移动到 ~15cm，是真实的学习信号，正常
+
+**规律**：`Episode_Reward/X` 是诊断各奖励项是否正确的主要工具；`mean_reward` 用于看整体趋势。
+
+---
+
+### 坑 6：`episode_length_s` 太长 + `num_steps_per_env` 太小，价值函数学不好
+
+**症状**：
+奖励上升极慢，早期价值函数误差大。
+
+**根因**：
+- 原始配置：`episode_length_s = 200s`（6000 步），`num_steps_per_env = 24`
+- 每次 rollout 只覆盖 24 步，是整个 episode 的 0.4%
+- 价值函数几乎看不到 episode 结束，bootstrap error 积累严重
+
+**解决方案**：
+- `episode_length_s = 10.0`（300 步，允许机械臂有足够时间接近目标）
+- `num_steps_per_env = 128`（一次 rollout 覆盖 ~43% 的 episode）
+- 这两个参数的比例大致保持 `num_steps_per_env / (episode_length × control_freq) ≥ 20%`
+
+---
+
+### 坑 7：tanh 奖励在训练初期无梯度（std 校准问题）
+
+**症状**：
+使用 `dist_to_port_tanh(std=0.05)` 时，在整个训练过程中奖励接近 0，策略无法从这个信号学习。
+
+**根因**：
+训练开始时 EE 距离 NIC 卡约 25cm（0.25m）。`tanh(0.25/0.05) = tanh(5) ≈ 0.9999`，奖励 = `1 - 0.9999 ≈ 0.0001`，梯度几乎为 0。`std` 参数需要**接近 EE 的初始距离**才有梯度，而不是接近"理想精度"。
+
+**解决方案**：
+- 训练初期用 `dist_to_port_exp`（`exp(-dist/0.15)`）：dist=0.25m 时值 = `exp(-1.67)≈0.19`，有实际梯度
+- 若用 tanh，`std` 应设为初始 EE-port 距离的 1/3 左右（~0.08-0.1m），而非最终精度（0.005-0.01m）
+- 课程学习思路：先大 std，接近后再换小 std（需要手动切换或课程调度）
+
+---
+
+### 快速诊断 checklist
+
+当奖励全为 0 或不变时，按顺序排查：
+
+1. **相机报错？** → 检查 `__post_init__` 里是否有 `TiledCameraCfg` 创建语句
+2. **Episode_Reward/X 全 0？** → 在奖励函数里加一行 `print(dist.mean())` 验证函数被调用且有非零输出；检查是否用了 `body_ids[0]`
+3. **前 50 迭代数据异常？** → obs normalization 预热，正常，等到 50 迭代后再判断
+4. **奖励有非零值但策略不动？** → 检查 `std` / `sigma` 是否匹配初始 EE-port 距离
+5. **float 参数看起来没生效？** → 把参数硬编码进函数，排除 `RewTerm.params` 转发问题

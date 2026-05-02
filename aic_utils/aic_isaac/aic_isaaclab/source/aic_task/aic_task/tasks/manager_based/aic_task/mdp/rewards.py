@@ -190,16 +190,28 @@ def body_lin_acc_l2(
 # Port-targeting rewards for cable-insertion task
 # ---------------------------------------------------------------------------
 
+# Cache to avoid calling find_bodies every step.
+_ee_body_idx: dict[str, int] = {}
+
+
+def _get_ee_pos(robot: Articulation, body_name: str) -> torch.Tensor:
+    """Return EE world position; caches the body index on first call."""
+    if body_name not in _ee_body_idx:
+        idx, _ = robot.find_bodies(body_name)
+        _ee_body_idx[body_name] = idx[0]
+    return robot.data.body_pos_w[:, _ee_body_idx[body_name], :]
+
 
 def dist_to_port(
     env: ManagerBasedRLEnv,
     robot_cfg: SceneEntityCfg,
     port_cfg: SceneEntityCfg,
+    ee_body_name: str = "wrist_3_link",
 ) -> torch.Tensor:
     """L2 distance from EE to port origin. Use with a negative weight."""
     robot: Articulation = env.scene[robot_cfg.name]
     port: RigidObject = env.scene[port_cfg.name]
-    ee_pos = robot.data.body_pos_w[:, robot_cfg.body_ids[0], :]
+    ee_pos = _get_ee_pos(robot, ee_body_name)
     port_pos = port.data.root_pos_w[:, :3]
     return torch.norm(ee_pos - port_pos, dim=1)
 
@@ -209,14 +221,30 @@ def dist_to_port_tanh(
     robot_cfg: SceneEntityCfg,
     port_cfg: SceneEntityCfg,
     std: float = 0.05,
+    ee_body_name: str = "wrist_3_link",
 ) -> torch.Tensor:
     """Tanh reward in [0, 1] that peaks at 1.0 when EE is on the port."""
     robot: Articulation = env.scene[robot_cfg.name]
     port: RigidObject = env.scene[port_cfg.name]
-    ee_pos = robot.data.body_pos_w[:, robot_cfg.body_ids[0], :]
+    ee_pos = _get_ee_pos(robot, ee_body_name)
     port_pos = port.data.root_pos_w[:, :3]
     dist = torch.norm(ee_pos - port_pos, dim=1)
     return 1.0 - torch.tanh(dist / std)
+
+
+def dist_to_port_exp(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg,
+    port_cfg: SceneEntityCfg,
+    ee_body_name: str = "wrist_3_link",
+) -> torch.Tensor:
+    """Exp-shaped reward: exp(-dist/0.15). Active within ~0.3m, peaks at 1.0 on port."""
+    robot: Articulation = env.scene[robot_cfg.name]
+    port: RigidObject = env.scene[port_cfg.name]
+    ee_pos = _get_ee_pos(robot, ee_body_name)
+    port_pos = port.data.root_pos_w[:, :3]
+    dist = torch.norm(ee_pos - port_pos, dim=1)
+    return torch.exp(-dist / 0.15)
 
 
 def insertion_success_bonus(
@@ -224,11 +252,12 @@ def insertion_success_bonus(
     robot_cfg: SceneEntityCfg,
     port_cfg: SceneEntityCfg,
     threshold: float = 0.01,
+    ee_body_name: str = "wrist_3_link",
 ) -> torch.Tensor:
     """Sparse +1 when EE is within *threshold* metres of port origin."""
     robot: Articulation = env.scene[robot_cfg.name]
     port: RigidObject = env.scene[port_cfg.name]
-    ee_pos = robot.data.body_pos_w[:, robot_cfg.body_ids[0], :]
+    ee_pos = _get_ee_pos(robot, ee_body_name)
     port_pos = port.data.root_pos_w[:, :3]
     dist = torch.norm(ee_pos - port_pos, dim=1)
     return (dist < threshold).float()
