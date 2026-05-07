@@ -27,9 +27,9 @@ from geometry_msgs.msg import Twist, Vector3, Wrench
 # Hyper-parameters matching Isaac Lab training
 # ---------------------------------------------------------------------------
 
-# Default joint positions from ArticulationCfg.InitialStateCfg in aic_task_env_cfg.py.
-# joint_pos_rel = actual_pos - default_pos, so we subtract these here.
-_JOINT_NAMES = [
+# The 6 UR5e arm joints and their default positions (from ArticulationCfg.InitialStateCfg).
+# Verify _ARM_JOINT_IDXS with inspect_joints.py — assumed to be 0-5 (arm before cable).
+_ARM_JOINT_NAMES = [
     "shoulder_pan_joint",
     "shoulder_lift_joint",
     "elbow_joint",
@@ -37,12 +37,16 @@ _JOINT_NAMES = [
     "wrist_2_joint",
     "wrist_3_joint",
 ]
-_JOINT_DEFAULT = np.array(
+_ARM_JOINT_DEFAULT = np.array(
     [0.1597, -1.3542, -1.6648, -1.6933, 1.5710, 1.4110], dtype=np.float32
 )
+# Indices of the 6 arm joints within the full robot joint array (arm + cable).
+# Run inspect_joints.py inside the Isaac Lab container to verify.
+_ARM_JOINT_IDXS = list(range(6))  # assumed 0-5; update after inspect_joints.py
 
-# Network architecture from rsl_rl_ppo_cfg.py
-_OBS_DIM = 28
+# obs_dim is read from the checkpoint at load time (_OBS_DIM set in __init__).
+# Training obs: joint_pos_rel(N) + joint_vel(N) + eef_pose(7) + port_rel(3) + last_action(6)
+# where N = total robot joints (arm + cable, e.g. 46 → obs_dim=108).
 _ACT_DIM = 6
 _HIDDEN = [512, 256, 128]
 
@@ -55,29 +59,33 @@ _CONTROL_HZ = 20.0
 
 
 # ---------------------------------------------------------------------------
-# Actor network (mirrors RSL-RL EmpiricalNormalization + MLP)
+# Actor network (mirrors RSL-RL ActorCritic with per-actor obs normalizer)
 # ---------------------------------------------------------------------------
 
 class _EmpiricalNorm(nn.Module):
-    """Running mean/var normalizer matching RSL-RL's EmpiricalNormalization."""
+    """Matches RSL-RL's EmpiricalNormalization buffer shapes exactly.
+
+    _mean/_var/_std are [1, shape] (batch dim kept); count is a scalar tensor.
+    """
 
     def __init__(self, shape: int, eps: float = 1e-8):
         super().__init__()
         self.eps = eps
-        self.register_buffer("running_mean", torch.zeros(shape))
-        self.register_buffer("running_var", torch.ones(shape))
-        self.register_buffer("running_count", torch.zeros(1))
+        self.register_buffer("_mean", torch.zeros(1, shape))
+        self.register_buffer("_var", torch.ones(1, shape))
+        self.register_buffer("_std", torch.ones(1, shape))
+        self.register_buffer("count", torch.tensor(0.0))  # scalar []
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return (x - self.running_mean) / (self.running_var.sqrt() + self.eps)
+        return (x - self._mean) / (self._std + self.eps)
 
 
 class _Actor(nn.Module):
-    """Actor MLP with obs normalisation, matching Isaac Lab RSL-RL PPO checkpoint."""
+    """Actor MLP — attribute name actor_obs_normalizer matches RSL-RL checkpoint keys."""
 
     def __init__(self, obs_dim: int, hidden: list, act_dim: int):
         super().__init__()
-        self.obs_normalizer = _EmpiricalNorm(obs_dim)
+        self.actor_obs_normalizer = _EmpiricalNorm(obs_dim)
         layers: list = []
         prev = obs_dim
         for h in hidden:
@@ -87,7 +95,7 @@ class _Actor(nn.Module):
         self.actor = nn.Sequential(*layers)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        return self.actor(self.obs_normalizer(obs))
+        return self.actor(self.actor_obs_normalizer(obs))
 
 
 # ---------------------------------------------------------------------------
@@ -100,9 +108,6 @@ class RLPolicy(Policy):
     def __init__(self, parent_node):
         super().__init__(parent_node)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        # Build actor
-        self._actor = _Actor(_OBS_DIM, _HIDDEN, _ACT_DIM)
 
         # Load checkpoint from ROS 2 share directory
         ckpt_path = Path(get_package_share_directory("my_policy_node")) / "checkpoints" / "model_best.pt"
@@ -117,13 +122,22 @@ class RLPolicy(Policy):
         raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         state_dict = raw.get("model_state_dict", raw)
 
-        self.get_logger().info(f"Checkpoint keys: {list(state_dict.keys())[:20]}")
+        # Derive obs_dim and n_joints from checkpoint shape.
+        obs_dim = int(state_dict["actor.0.weight"].shape[1])
+        self._n_joints = (obs_dim - 16) // 2  # obs = joints*2 + eef(7) + port(3) + action(6)
+        self.get_logger().info(
+            f"Checkpoint obs_dim={obs_dim}, n_joints={self._n_joints}, "
+            f"arm_idxs={_ARM_JOINT_IDXS}"
+        )
 
-        # Build a mapping: strip any 'actor_critic.' prefix, keep actor & normalizer keys.
+        # Build actor with correct obs_dim.
+        self._actor = _Actor(obs_dim, _HIDDEN, _ACT_DIM)
+
+        # Strip 'actor_critic.' prefix; keep actor weights and obs normalizer.
         actor_state: dict = {}
         for k, v in state_dict.items():
             k2 = k.removeprefix("actor_critic.")
-            if k2.startswith(("actor.", "actor_mean.", "obs_normalizer.")):
+            if k2.startswith(("actor.", "actor_obs_normalizer.")):
                 actor_state[k2] = v
 
         missing, unexpected = self._actor.load_state_dict(actor_state, strict=False)
@@ -170,9 +184,9 @@ class RLPolicy(Policy):
         quat = np.array([r.w, r.x, r.y, r.z], dtype=np.float32)
         return pos, quat
 
-    def _joint_indices(self, joint_names: list) -> list:
-        """Map UR5e joint names to indices in joint_states.name list."""
-        return [joint_names.index(n) for n in _JOINT_NAMES]
+    def _arm_indices_in_js(self, joint_names: list) -> list:
+        """Indices of the 6 arm joints within Gazebo's joint_states.name list."""
+        return [joint_names.index(n) for n in _ARM_JOINT_NAMES]
 
     def _build_obs(
         self,
@@ -181,37 +195,44 @@ class RLPolicy(Policy):
         plug_quat_wxyz: np.ndarray,
         entrance_pos: np.ndarray,
     ) -> torch.Tensor:
-        """Build 28-dim observation matching Isaac Lab training order.
+        """Build obs vector matching Isaac Lab training order.
 
-        Order: joint_pos(6) | joint_vel(6) | eef_pose(7) | port_rel(3) | last_action(6)
+        The training env included ALL robot joints (arm + cable) in joint_pos_rel and
+        joint_vel, giving n_joints dims each. Cable joints are not observable in Gazebo
+        so they are set to 0 (their training default relative value).
+
+        Order: joint_pos_rel(n_joints) | joint_vel(n_joints) | eef_pose(7) | port_rel(3) | last_action(6)
         """
         js = obs_msg.joint_states
         js_names = list(js.name)
         try:
-            idxs = self._joint_indices(js_names)
-            joint_pos = np.array([js.position[i] for i in idxs], dtype=np.float32)
-            joint_vel = np.array([js.velocity[i] for i in idxs], dtype=np.float32)
+            arm_idxs_in_js = self._arm_indices_in_js(js_names)
+            arm_pos = np.array([js.position[i] for i in arm_idxs_in_js], dtype=np.float32)
+            arm_vel = np.array([js.velocity[i] for i in arm_idxs_in_js], dtype=np.float32)
         except ValueError:
-            # Fallback: assume first 6 joints are the arm
-            joint_pos = np.array(js.position[:6], dtype=np.float32)
-            joint_vel = np.array(js.velocity[:6], dtype=np.float32)
+            arm_pos = np.array(js.position[:6], dtype=np.float32)
+            arm_vel = np.array(js.velocity[:6], dtype=np.float32)
 
-        # joint_pos_rel = actual − default (matching Isaac Lab's joint_pos_rel)
-        joint_pos_rel = joint_pos - _JOINT_DEFAULT
+        # Build full joint arrays; cable joints default to 0 (matching training default_rel=0).
+        full_pos_rel = np.zeros(self._n_joints, dtype=np.float32)
+        full_vel = np.zeros(self._n_joints, dtype=np.float32)
+        for i, arm_idx in enumerate(_ARM_JOINT_IDXS):
+            full_pos_rel[arm_idx] = arm_pos[i] - _ARM_JOINT_DEFAULT[i]
+            full_vel[arm_idx] = arm_vel[i]
 
-        # eef_pose: sfp_tip_link world pos + quat (7 dims)
+        # eef_pose: sfp_tip_link world pos + quat wxyz (7 dims)
         eef_pose = np.concatenate([plug_pos, plug_quat_wxyz])
 
         # port_rel: entrance_pos − sfp_tip_pos (3 dims)
         port_rel = entrance_pos - plug_pos
 
         obs = np.concatenate([
-            joint_pos_rel,      # 6
-            joint_vel,          # 6
+            full_pos_rel,       # n_joints
+            full_vel,           # n_joints
             eef_pose,           # 7
             port_rel,           # 3
             self._last_action,  # 6
-        ])  # = 28
+        ])
 
         return torch.from_numpy(obs).float().unsqueeze(0).to(self.device)
 
