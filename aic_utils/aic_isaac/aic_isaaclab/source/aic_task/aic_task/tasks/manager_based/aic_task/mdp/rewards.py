@@ -20,7 +20,7 @@ import torch
 
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import combine_frame_transforms, quat_error_magnitude, quat_mul
+from isaaclab.utils.math import combine_frame_transforms, quat_apply, quat_error_magnitude, quat_mul
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -193,6 +193,11 @@ def body_lin_acc_l2(
 # Cache to avoid calling find_bodies every step.
 _ee_body_idx: dict[str, int] = {}
 
+# sfp_port_0_link_entrance offset in NIC card local frame.
+# Derived from USD prim hierarchy: entrance world pos minus card root, then
+# rotated back through the card's fixed init rotation R=[[-1,0,0],[0,0,-1],[0,-1,0]].
+_SFP_PORT_0_LOCAL_OFFSET = torch.tensor([0.01295, -0.07737, 0.00556])
+
 
 def _get_ee_pos(robot: Articulation, body_name: str) -> torch.Tensor:
     """Return EE world position; caches the body index on first call."""
@@ -202,17 +207,24 @@ def _get_ee_pos(robot: Articulation, body_name: str) -> torch.Tensor:
     return robot.data.body_pos_w[:, _ee_body_idx[body_name], :]
 
 
+def _get_sfp_entrance_pos(port: RigidObject) -> torch.Tensor:
+    """World position of sfp_port_0_link_entrance, robust to NIC card pose changes."""
+    offset = _SFP_PORT_0_LOCAL_OFFSET.to(port.data.root_pos_w.device)
+    offset_b = offset.unsqueeze(0).expand(port.data.root_pos_w.shape[0], -1)
+    return port.data.root_pos_w[:, :3] + quat_apply(port.data.root_quat_w, offset_b)
+
+
 def dist_to_port(
     env: ManagerBasedRLEnv,
     robot_cfg: SceneEntityCfg,
     port_cfg: SceneEntityCfg,
-    ee_body_name: str = "wrist_3_link",
+    ee_body_name: str = "sfp_tip_link",
 ) -> torch.Tensor:
     """L2 distance from EE to port origin. Use with a negative weight."""
     robot: Articulation = env.scene[robot_cfg.name]
     port: RigidObject = env.scene[port_cfg.name]
     ee_pos = _get_ee_pos(robot, ee_body_name)
-    port_pos = port.data.root_pos_w[:, :3]
+    port_pos = _get_sfp_entrance_pos(port)
     return torch.norm(ee_pos - port_pos, dim=1)
 
 
@@ -221,13 +233,13 @@ def dist_to_port_tanh(
     robot_cfg: SceneEntityCfg,
     port_cfg: SceneEntityCfg,
     std: float = 0.05,
-    ee_body_name: str = "wrist_3_link",
+    ee_body_name: str = "sfp_tip_link",
 ) -> torch.Tensor:
     """Tanh reward in [0, 1] that peaks at 1.0 when EE is on the port."""
     robot: Articulation = env.scene[robot_cfg.name]
     port: RigidObject = env.scene[port_cfg.name]
     ee_pos = _get_ee_pos(robot, ee_body_name)
-    port_pos = port.data.root_pos_w[:, :3]
+    port_pos = _get_sfp_entrance_pos(port)
     dist = torch.norm(ee_pos - port_pos, dim=1)
     return 1.0 - torch.tanh(dist / std)
 
@@ -236,15 +248,30 @@ def dist_to_port_exp(
     env: ManagerBasedRLEnv,
     robot_cfg: SceneEntityCfg,
     port_cfg: SceneEntityCfg,
-    ee_body_name: str = "wrist_3_link",
+    ee_body_name: str = "sfp_tip_link",
 ) -> torch.Tensor:
     """Exp-shaped reward: exp(-dist/0.15). Active within ~0.3m, peaks at 1.0 on port."""
     robot: Articulation = env.scene[robot_cfg.name]
     port: RigidObject = env.scene[port_cfg.name]
     ee_pos = _get_ee_pos(robot, ee_body_name)
-    port_pos = port.data.root_pos_w[:, :3]
+    port_pos = _get_sfp_entrance_pos(port)
     dist = torch.norm(ee_pos - port_pos, dim=1)
     return torch.exp(-dist / 0.15)
+
+
+def dist_to_port_exp_fine(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg,
+    port_cfg: SceneEntityCfg,
+    ee_body_name: str = "sfp_tip_link",
+) -> torch.Tensor:
+    """Tight exp reward: exp(-dist/0.02). Active within ~6cm, near 1.0 at 1cm."""
+    robot: Articulation = env.scene[robot_cfg.name]
+    port: RigidObject = env.scene[port_cfg.name]
+    ee_pos = _get_ee_pos(robot, ee_body_name)
+    port_pos = _get_sfp_entrance_pos(port)
+    dist = torch.norm(ee_pos - port_pos, dim=1)
+    return torch.exp(-dist / 0.02)
 
 
 def insertion_success_bonus(
@@ -252,12 +279,12 @@ def insertion_success_bonus(
     robot_cfg: SceneEntityCfg,
     port_cfg: SceneEntityCfg,
     threshold: float = 0.01,
-    ee_body_name: str = "wrist_3_link",
+    ee_body_name: str = "sfp_tip_link",
 ) -> torch.Tensor:
     """Sparse +1 when EE is within *threshold* metres of port origin."""
     robot: Articulation = env.scene[robot_cfg.name]
     port: RigidObject = env.scene[port_cfg.name]
     ee_pos = _get_ee_pos(robot, ee_body_name)
-    port_pos = port.data.root_pos_w[:, :3]
+    port_pos = _get_sfp_entrance_pos(port)
     dist = torch.norm(ee_pos - port_pos, dim=1)
     return (dist < threshold).float()

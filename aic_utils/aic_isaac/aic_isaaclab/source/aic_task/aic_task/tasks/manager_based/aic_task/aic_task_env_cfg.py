@@ -365,14 +365,14 @@ class ObservationsCfg:
         # End-effector pose in world frame (pos xyz + quat wxyz = 7 dims)
         eef_pose = ObsTerm(
             func=mdp.body_pose_w,
-            params={"asset_cfg": SceneEntityCfg("robot", body_names="wrist_3_link")},
+            params={"asset_cfg": SceneEntityCfg("robot", body_names="sfp_tip_link")},
             noise=Unoise(n_min=-0.001, n_max=0.001),
         )
         # Port position relative to EE (3 dims); ground-truth, no noise during training
         port_rel = ObsTerm(
             func=mdp.port_relative_to_ee,
             params={
-                "robot_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+                "robot_cfg": SceneEntityCfg("robot", body_names="sfp_tip_link"),
                 "port_cfg": SceneEntityCfg("nic_card"),
             },
         )
@@ -397,7 +397,7 @@ class RewardsCfg:
         func=mdp.dist_to_port,
         weight=-2.0,
         params={
-            "robot_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+            "robot_cfg": SceneEntityCfg("robot", body_names="sfp_tip_link"),
             "port_cfg": SceneEntityCfg("nic_card"),
         },
     )
@@ -406,7 +406,16 @@ class RewardsCfg:
         func=mdp.dist_to_port_exp,
         weight=5.0,
         params={
-            "robot_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+            "robot_cfg": SceneEntityCfg("robot", body_names="sfp_tip_link"),
+            "port_cfg": SceneEntityCfg("nic_card"),
+        },
+    )
+    # Fine exp shaping: active within ~6cm, strong gradient for last-mile approach
+    dist_to_sfp_exp_fine = RewTerm(
+        func=mdp.dist_to_port_exp_fine,
+        weight=5.0,
+        params={
+            "robot_cfg": SceneEntityCfg("robot", body_names="sfp_tip_link"),
             "port_cfg": SceneEntityCfg("nic_card"),
         },
     )
@@ -414,7 +423,7 @@ class RewardsCfg:
         func=mdp.insertion_success_bonus,
         weight=10.0,
         params={
-            "robot_cfg": SceneEntityCfg("robot", body_names="wrist_3_link"),
+            "robot_cfg": SceneEntityCfg("robot", body_names="sfp_tip_link"),
             "port_cfg": SceneEntityCfg("nic_card"),
         },
     )

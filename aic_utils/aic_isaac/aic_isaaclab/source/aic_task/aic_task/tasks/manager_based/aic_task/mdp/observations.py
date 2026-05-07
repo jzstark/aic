@@ -57,14 +57,21 @@ def port_relative_to_ee(
     env: ManagerBasedRLEnv,
     robot_cfg: SceneEntityCfg,
     port_cfg: SceneEntityCfg,
-    ee_body_name: str = "wrist_3_link",
+    ee_body_name: str = "sfp_tip_link",
 ) -> torch.Tensor:
-    """Port world position minus EE world position. Shape: (N, 3)."""
+    """sfp_port_0_link_entrance world pos minus sfp_tip_link world pos. Shape: (N, 3)."""
     from isaaclab.assets import Articulation, RigidObject
+    from isaaclab.utils.math import quat_apply
 
     robot: Articulation = env.scene[robot_cfg.name]
     port: RigidObject = env.scene[port_cfg.name]
+
     ee_idx = robot.find_bodies(ee_body_name)[0][0]
     ee_pos = robot.data.body_pos_w[:, ee_idx, :]
-    port_pos = port.data.root_pos_w[:, :3]
-    return port_pos - ee_pos
+
+    # Target the actual SFP cage entrance, not the card root.
+    offset = torch.tensor([0.01295, -0.07737, 0.00556], device=port.data.root_pos_w.device)
+    offset_b = offset.unsqueeze(0).expand(port.data.root_pos_w.shape[0], -1)
+    entrance_pos = port.data.root_pos_w[:, :3] + quat_apply(port.data.root_quat_w, offset_b)
+
+    return entrance_pos - ee_pos

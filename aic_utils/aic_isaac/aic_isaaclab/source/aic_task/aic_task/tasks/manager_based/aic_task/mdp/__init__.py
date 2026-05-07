@@ -25,6 +25,7 @@ from .rewards import (  # noqa: F401
     body_lin_acc_l2,
     dist_to_port,
     dist_to_port_exp,
+    dist_to_port_exp_fine,
     dist_to_port_tanh,
     ee_reaching_bonus,
     insertion_success_bonus,
