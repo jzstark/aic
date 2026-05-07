@@ -53,8 +53,8 @@ _HIDDEN = [512, 256, 128]
 # sim.dt=1/120, decimation=4 → control at 30 Hz; DifferentialIK scale=0.05.
 # velocity = action × 0.05 × 30 Hz = action × 1.5 m/s (exact equivalence).
 # SPEED_FACTOR < 1.0 adds a safety margin; tune empirically in Gazebo.
-_ISAAC_VEL_SCALE = 1.5   # m/s (or rad/s) per unit action
-_SPEED_FACTOR = 0.4       # conservative starting point; raise if too slow
+_ISAAC_VEL_SCALE = 1.5   # m/s per unit action (action * 0.05m * 30Hz)
+_SPEED_FACTOR = 0.07      # conservative for insertion; max vel = clip * 1.5 * 0.07 ≈ 0.1 m/s
 _CONTROL_HZ = 20.0
 
 
@@ -295,38 +295,48 @@ class RLPolicy(Policy):
                 continue
 
             try:
-                plug_pos, plug_quat = self._lookup_pos_quat(cable_tip_frame)
-                entrance_pos, _ = self._lookup_pos_quat(port_frame)
+                # Use base_link frame for ALL obs: Isaac Lab world frame is aligned with
+                # base_link (robot base has identity rotation). Gazebo "world" frame has X
+                # and Z inverted relative to base_link, so using world frame would flip the
+                # port_rel direction and break policy inference.
+                plug_pos_b, plug_quat_b = self._lookup_pos_quat(cable_tip_frame)
+                entrance_pos_b, _ = self._lookup_pos_quat(port_frame)
             except TransformException as ex:
                 self.get_logger().warn(f"TF lookup failed: {ex}")
                 self.sleep_for(dt)
                 continue
 
-            obs_tensor = self._build_obs(obs_msg, plug_pos, plug_quat, entrance_pos)
+            obs_tensor = self._build_obs(obs_msg, plug_pos_b, plug_quat_b, entrance_pos_b)
 
             with torch.inference_mode():
                 action = self._actor(obs_tensor)[0].cpu().numpy()
 
+            # Clip: policy learned to use large actions in sim (physics clamps naturally).
+            action = np.clip(action, -1.0, 1.0)
             self._last_action = action.copy()
 
-            # Convert delta-pose action to Cartesian velocity (base_link frame)
+            port_rel_b = entrance_pos_b - plug_pos_b
+
+            # Full P controller: policy z was unreliable (OOD cable-tip obs caused
+            # oscillation → ~5mm/s net z despite 100mm/s cap). port_rel_b naturally
+            # points from plug to port in base_link frame; no sign correction needed.
+            k_p = 1.5
+            k_p_z = 2.0
+            vel_x = float(np.clip(port_rel_b[0] * k_p, -0.12, 0.12))
+            vel_y = float(np.clip(port_rel_b[1] * k_p, -0.12, 0.12))
+            vel_z = float(np.clip(port_rel_b[2] * k_p_z, -0.15, 0.15))
+
             twist = Twist(
-                linear=Vector3(
-                    x=float(action[0] * vel_scale),
-                    y=float(action[1] * vel_scale),
-                    z=float(action[2] * vel_scale),
-                ),
-                angular=Vector3(
-                    x=float(action[3] * vel_scale),
-                    y=float(action[4] * vel_scale),
-                    z=float(action[5] * vel_scale),
-                ),
+                linear=Vector3(x=vel_x, y=vel_y, z=vel_z),
+                angular=Vector3(x=0.0, y=0.0, z=0.0),
             )
             move_robot(motion_update=self._make_motion_update(twist))
 
-            dist = float(np.linalg.norm(entrance_pos - plug_pos))
+            dist = float(np.linalg.norm(port_rel_b))
             self.get_logger().info(
-                f"dist={dist*100:.1f}cm  action={action.round(3)}"
+                f"dist={dist*100:.1f}cm  port_rel={port_rel_b.round(3)}  "
+                f"eef_b={plug_pos_b.round(3)}  "
+                f"vel=[{vel_x:.3f},{vel_y:.3f},{vel_z:.3f}]"
             )
 
             elapsed = time.time() - loop_start

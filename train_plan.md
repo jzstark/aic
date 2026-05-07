@@ -894,7 +894,7 @@ pixi run ros2 run aic_model aic_model --ros-args \
 
 **关键顺序要求**：
 
-1. **必须先启动 Gazebo，再启动策略节点**。策略节点在初始化时会等待 TF 树（10 秒超时）。如果 Gazebo 还没起来，TF 查找会超时，策略 abort。
+1. **必须先启动 策略节点，再启动Gazebo eval**。
 2. **使用 `bash -x /entrypoint.sh`，不要用 `distrobox enter -r aic_eval && /entrypoint.sh`**。直接 `distrobox enter` 后执行 entrypoint.sh 会立即退出（distrobox 非交互式 shell 的 init 问题）；`bash -x` 方式可以正常启动 Gazebo 和 RViz。
 3. 启动策略节点前**无需单独启动 Zenoh router**。`bash -x /entrypoint.sh` 已经在内部启动了 Zenoh，策略节点通过 pixi 的 ROS 2 环境自动接入同一 ROS 2 DDS 网络。
 
