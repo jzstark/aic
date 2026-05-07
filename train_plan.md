@@ -815,3 +815,226 @@ Isaac Lab 的 `RewTerm` 参数分发逻辑对 `SceneEntityCfg` 对象有特殊�
 3. **前 50 迭代数据异常？** → obs normalization 预热，正常，等到 50 迭代后再判断
 4. **奖励有非零值但策略不动？** → 检查 `std` / `sigma` 是否匹配初始 EE-port 距离
 5. **float 参数看起来没生效？** → 把参数硬编码进函数，排除 `RewTerm.params` 转发问题
+
+---
+
+## 重要修正：Phase 3 体坐标系错误（已在实际代码中修复）
+
+Phase 3 文档中的代码片段用了错误的 body 名称和端口位置，这是实际训练初期 `insertion_success=0` 的根本原因。**以下是正确实现，与现在代码中实际存在的一致：**
+
+### 正确的 EE frame：`sfp_tip_link`，不是 `wrist_3_link`
+
+`wrist_3_link` 是机械臂法兰盘，`sfp_tip_link` 才是 SFP 线缆插头尖端，二者相差约 25cm。将 `wrist_3_link` 当做 EE 会导致策略学习错误的接近目标，训练完后看起来有收敛但实际永远不会插入。
+
+所有 `RewardsCfg` 和 `ObservationsCfg` 中的 `body_names` 必须是 `"sfp_tip_link"`。
+
+### 正确的端口位置：`sfp_port_0_link_entrance`，不是 NIC 卡 root
+
+NIC 卡的 `root_pos_w`（Z≈0.074m）是卡的几何中心，SFP 端口入口（Z≈0.152m）在其上方 7.7cm。必须用 local offset + `quat_apply` 计算真实入口位置：
+
+```python
+_SFP_PORT_0_LOCAL_OFFSET = torch.tensor([0.01295, -0.07737, 0.00556])
+
+def _get_sfp_entrance_pos(port: RigidObject) -> torch.Tensor:
+    offset = _SFP_PORT_0_LOCAL_OFFSET.to(port.data.root_pos_w.device)
+    offset_b = offset.unsqueeze(0).expand(port.data.root_pos_w.shape[0], -1)
+    return port.data.root_pos_w[:, :3] + quat_apply(port.data.root_quat_w, offset_b)
+```
+
+**如何确认 body frame 和端口位置**：
+
+使用 `scripts/inspect_bodies.py` 和 `scripts/inspect_joints.py` 脚本（已存在于代码库中），在 Isaac Lab 容器内运行：
+
+```bash
+isaaclab -p aic/aic_utils/aic_isaac/aic_isaaclab/scripts/inspect_bodies.py
+isaaclab -p aic/aic_utils/aic_isaac/aic_isaaclab/scripts/inspect_joints.py
+```
+
+---
+
+## 训练结果：实际观测维度（108 维，非 28 维）
+
+训练用的 `aic_unified_robot_cable_sdf.usd` 是一体化 robot+cable 资产，包含 **46 个关节**（6 个臂关节 + 40 个线缆段关节）。`joint_pos_rel` 和 `joint_vel_rel` 没有指定 `joint_names`，所以默认对全部 46 个关节采样：
+
+```
+obs_dim = 46 + 46 + 7 + 3 + 6 = 108
+         ↑    ↑    ↑   ↑   ↑
+         all  all  eef port last
+         jpos jvel pos  rel  act
+```
+
+关节顺序（由 `inspect_joints.py` 确认）：
+
+| idx | 名称 | default |
+|-----|------|---------|
+| 0-5 | 6 个 UR5e 臂关节 | [0.1597, -1.3542, -1.6648, -1.6933, 1.5710, 1.4110] |
+| 6-45 | 40 个线缆段关节 (`joint_0_1:1`…) | 全部 0.0 |
+
+**部署时的处理**：Gazebo 的 `joint_states` 只有 6 个臂关节，线缆关节不可观测。部署策略用零填充 idx 6-45（它们的训练默认值即为 0），只把臂关节数据填入 idx 0-5。实验表明此近似足以使策略正常运行。
+
+---
+
+## Phase 5 正确启动顺序
+
+### 5.0 每次测试的启动步骤（顺序不能乱）
+
+```
+终端 1（Gazebo 评测环境）
+  ↓
+bash -x /entrypoint.sh ground_truth:=true start_aic_engine:=true
+  等待 Gazebo 窗口和 RViz 窗口弹出（约 20-30 秒）
+  ↓
+终端 2（RL 策略节点）
+  ↓
+cd ~/Code/ws_aic/src/aic
+pixi run ros2 run aic_model aic_model --ros-args \
+  -p use_sim_time:=true \
+  -p policy:=my_policy_node.RLPolicy
+```
+
+**关键顺序要求**：
+
+1. **必须先启动 Gazebo，再启动策略节点**。策略节点在初始化时会等待 TF 树（10 秒超时）。如果 Gazebo 还没起来，TF 查找会超时，策略 abort。
+2. **使用 `bash -x /entrypoint.sh`，不要用 `distrobox enter -r aic_eval && /entrypoint.sh`**。直接 `distrobox enter` 后执行 entrypoint.sh 会立即退出（distrobox 非交互式 shell 的 init 问题）；`bash -x` 方式可以正常启动 Gazebo 和 RViz。
+3. 启动策略节点前**无需单独启动 Zenoh router**。`bash -x /entrypoint.sh` 已经在内部启动了 Zenoh，策略节点通过 pixi 的 ROS 2 环境自动接入同一 ROS 2 DDS 网络。
+
+### 5.1（更新）从容器拷出 checkpoint 的正确路径
+
+Isaac Lab 容器内的日志路径是 `/workspace/isaaclab/logs/...`，不是 `/root/IsaacLab/logs/...`：
+
+```bash
+# 先找到训练时间戳
+docker exec isaac-lab-base ls /workspace/isaaclab/logs/rsl_rl/aic_task/
+
+# 拷出最佳 checkpoint（用实际时间戳和迭代数替换）
+docker cp isaac-lab-base:/workspace/isaaclab/logs/rsl_rl/aic_task/<timestamp>/model_3000.pt \
+    ~/Code/ws_aic/src/aic/my_policy_node/my_policy_node/checkpoints/model_best.pt
+```
+
+**checkpoint 安装方式**：`setup.py` 的 `data_files` 包含了 `checkpoints/*.pt`，所以每次 `pixi reinstall ros-kilted-my-policy-node` 时，checkpoint 会自动被复制到 ROS 2 share 目录（`ament_index_python` 可以找到）：
+
+```python
+# setup.py
+data_files=[
+    ...
+    ('share/my_policy_node/checkpoints', ['my_policy_node/checkpoints/model_best.pt']),
+],
+```
+
+```python
+# RLPolicy.py 加载路径
+from ament_index_python.packages import get_package_share_directory
+ckpt_path = Path(get_package_share_directory("my_policy_node")) / "checkpoints" / "model_best.pt"
+```
+
+**不要**把 checkpoint 手动复制到 `.pixi/envs/default/lib/.../site-packages/`——这是 hackish 的方式，下次 reinstall 就会丢失。
+
+### 5.2（更新）RLPolicy.py 的正确结构
+
+与 Phase 5 原始文档的差异：
+
+| 项目 | 原始文档（错误） | 实际正确 |
+|------|-----------------|---------|
+| obs_dim | 28（硬编码） | 从 checkpoint `actor.0.weight.shape[1]` 自动读取（=108） |
+| n_joints | 6（只有臂） | 46（臂+线缆），部署时线缆 idx 用 0 填充 |
+| normalizer 类型 | 自定义 `running_mean/var/count` | RSL-RL 格式：`_mean/_var/_std` 形状 `[1, obs_dim]`，`count` 为标量 |
+| normalizer 属性名 | `obs_normalizer` | `actor_obs_normalizer`（必须与 checkpoint key 完全一致） |
+| 加载 key 过滤 | `startswith("actor.", "obs_normalizer.")` | `startswith("actor.", "actor_obs_normalizer.")` |
+
+---
+
+## Phase 5 部署踩坑记录
+
+### 部署坑 1：checkpoint 路径 — `Path(__file__).parent` 在安装后失效
+
+**症状**：
+```
+FileNotFoundError: Checkpoint not found: /home/stark/.../site-packages/my_policy_node/checkpoints/model_best.pt
+```
+
+**根因**：用 `Path(__file__).parent / "checkpoints"` 时，`__file__` 在 `pixi reinstall` 后指向 site-packages 里的已安装文件，但 `checkpoints/` 目录没有被复制过去（仅 `.py` 文件被安装）。
+
+**解决方案**：
+1. 在 `setup.py` 里把 `checkpoints/*.pt` 加入 `data_files`（不是 `package_data`）
+2. 在代码里用 `ament_index_python.get_package_share_directory("my_policy_node")` 获取路径
+
+```python
+# setup.py
+('share/my_policy_node/checkpoints', ['my_policy_node/checkpoints/model_best.pt']),
+```
+
+**规律**：ROS 2 包的运行时资产（模型权重、配置文件等）应放在 `share/` 下（`data_files`），用 `ament_index_python` 查找，而非依赖 Python 模块路径。
+
+---
+
+### 部署坑 2：obs_dim 硬编码导致 size mismatch
+
+**症状**：
+```
+size mismatch for actor.0.weight: copying a param with shape torch.Size([512, 108])
+into torch.Size([512, 28])
+```
+
+**根因**：训练环境的 `joint_pos_rel`/`joint_vel_rel` 没有 `joint_names` 过滤，包含了全部 46 个关节，导致实际 obs_dim=108，而 RLPolicy.py 里硬编码了 `_OBS_DIM = 28`。
+
+**解决方案**：不硬编码 obs_dim，从 checkpoint 自动推断：
+
+```python
+obs_dim = int(state_dict["actor.0.weight"].shape[1])
+n_joints = (obs_dim - 16) // 2  # obs = joints*2 + eef(7) + port(3) + action(6)
+self._actor = _Actor(obs_dim, _HIDDEN, _ACT_DIM)
+```
+
+**规律**：网络输入维度永远从 checkpoint 读取，不要手动计算。手动计算容易因训练时的"细节"（如 env 包含了哪些关节）而出错。
+
+---
+
+### 部署坑 3：RSL-RL normalizer buffer 名称和形状不匹配
+
+**症状**：
+```
+size mismatch for actor_obs_normalizer._mean:
+  copying shape torch.Size([1, 108]) into torch.Size([108])
+```
+
+**根因**：RSL-RL 的 EmpiricalNormalization 使用的 buffer 名称和形状与自行实现时的直觉不同：
+- 名称：`_mean`、`_var`、`_std`（预计算的标准差），以及标量 `count`
+- 形状：`_mean/_var/_std` 是 `[1, obs_dim]`（带 batch 维），不是 `[obs_dim]`
+- `count` 是标量 `torch.tensor(0.0)`，形状 `[]`，不是 `torch.zeros(1)`（形状 `[1]`）
+
+**解决方案**：
+
+```python
+class _EmpiricalNorm(nn.Module):
+    def __init__(self, shape: int, eps: float = 1e-8):
+        super().__init__()
+        self.eps = eps
+        self.register_buffer("_mean", torch.zeros(1, shape))   # [1, shape]
+        self.register_buffer("_var",  torch.ones(1, shape))    # [1, shape]
+        self.register_buffer("_std",  torch.ones(1, shape))    # [1, shape]
+        self.register_buffer("count", torch.tensor(0.0))       # scalar []
+
+    def forward(self, x):
+        return (x - self._mean) / (self._std + self.eps)
+```
+
+**规律**：移植 RSL-RL checkpoint 时，先 `print(list(state_dict.keys()))` 和各 tensor 的 `.shape`，逐一对照自己实现的 buffer 名称和形状，再写加载代码。
+
+---
+
+### 部署坑 4：加载 key 过滤漏掉 normalizer
+
+**症状**：checkpoint 加载显示 `missing: ['actor_obs_normalizer._mean', ...]`，normalizer 用随机初始值而非训练值，推理结果错误。
+
+**根因**：加载过滤代码写的是 `startswith(("actor.", "obs_normalizer."))`，而 checkpoint 里的 key 是 `actor_obs_normalizer._mean`，它不以 `"actor."` 或 `"obs_normalizer."` 开头。
+
+**解决方案**：
+
+```python
+for k, v in state_dict.items():
+    k2 = k.removeprefix("actor_critic.")
+    if k2.startswith(("actor.", "actor_obs_normalizer.")):
+        actor_state[k2] = v
+```
+
+**规律**：写加载过滤前先把 `state_dict.keys()` 打印出来，确认实际 key 前缀，不要靠猜测。（代码里已有 `self.get_logger().info(f"Checkpoint keys: {list(state_dict.keys())[:20]}")` 正是为此设计的。）
