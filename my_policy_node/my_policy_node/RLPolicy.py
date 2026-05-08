@@ -59,6 +59,39 @@ _CONTROL_HZ = 20.0
 
 
 # ---------------------------------------------------------------------------
+# Quaternion utilities (wxyz convention — matches _lookup_pos_quat output)
+# ---------------------------------------------------------------------------
+
+def _quat_mul(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return np.array([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+    ], dtype=np.float32)
+
+
+def _quat_conj(q: np.ndarray) -> np.ndarray:
+    """Conjugate = inverse for unit quaternion [w,x,y,z]."""
+    return np.array([q[0], -q[1], -q[2], -q[3]], dtype=np.float32)
+
+
+def _quat_to_rotvec(q: np.ndarray) -> np.ndarray:
+    """Quaternion wxyz → rotation vector (axis × angle) in same reference frame."""
+    w = float(np.clip(q[0], -1.0, 1.0))
+    half = np.arccos(abs(w))
+    s = np.sin(half)
+    if s < 1e-7:
+        return np.zeros(3, dtype=np.float32)
+    axis = np.array([q[1], q[2], q[3]], dtype=np.float32) / s
+    if w < 0:
+        axis = -axis
+    return axis * (2.0 * half)
+
+
+# ---------------------------------------------------------------------------
 # Actor network (mirrors RSL-RL ActorCritic with per-actor obs normalizer)
 # ---------------------------------------------------------------------------
 
@@ -300,7 +333,7 @@ class RLPolicy(Policy):
                 # and Z inverted relative to base_link, so using world frame would flip the
                 # port_rel direction and break policy inference.
                 plug_pos_b, plug_quat_b = self._lookup_pos_quat(cable_tip_frame)
-                entrance_pos_b, _ = self._lookup_pos_quat(port_frame)
+                entrance_pos_b, q_port_wxyz = self._lookup_pos_quat(port_frame)
             except TransformException as ex:
                 self.get_logger().warn(f"TF lookup failed: {ex}")
                 self.sleep_for(dt)
@@ -315,24 +348,38 @@ class RLPolicy(Policy):
             action = np.clip(action, -1.0, 1.0)
             self._last_action = action.copy()
 
-            port_rel_b = entrance_pos_b - plug_pos_b
+            # Target 5cm past the port face: port_link sits at the entrance; full SFP/SC
+            # insertion seats the connector ~4-5cm deeper along −Z (vertical insertion axis).
+            # Obs still use actual entrance_pos_b; only the velocity target is shifted.
+            insertion_target_b = entrance_pos_b.copy()
+            insertion_target_b[2] -= 0.06
+            port_rel_b = insertion_target_b - plug_pos_b
 
-            # Full P controller: policy z was unreliable (OOD cable-tip obs caused
-            # oscillation → ~5mm/s net z despite 100mm/s cap). port_rel_b naturally
-            # points from plug to port in base_link frame; no sign correction needed.
+            # Full P controller — caps at ≤0.05 m/s prevent tracking-error resets.
             k_p = 1.5
             k_p_z = 2.0
-            vel_x = float(np.clip(port_rel_b[0] * k_p, -0.12, 0.12))
-            vel_y = float(np.clip(port_rel_b[1] * k_p, -0.12, 0.12))
-            vel_z = float(np.clip(port_rel_b[2] * k_p_z, -0.15, 0.15))
+            vel_x = float(np.clip(port_rel_b[0] * k_p, -0.06, 0.06))
+            vel_y = float(np.clip(port_rel_b[1] * k_p, -0.06, 0.06))
+            # Constant bias ensures the arm keeps pushing past the target depth
+            # rather than decelerating to zero at port_link face (P controller alone
+            # stalls when connector friction > commanded force at target).
+            # Equilibrium shifts to port_rel_b[2] = 0.015/2.0 = 0.75 cm past target.
+            vel_z = float(np.clip(port_rel_b[2] * k_p_z, -0.05, 0.05))
+
+            # Angular correction: rotate EE so plug frame aligns with port frame.
+            # q_diff = q_port * q_plug_inv — same formula as CheatCode.
+            # rotvec in base_link gives the angular velocity direction.
+            q_diff = _quat_mul(q_port_wxyz, _quat_conj(plug_quat_b))
+            rotvec = _quat_to_rotvec(q_diff)
+            omega = np.clip(rotvec * 0.5, -0.15, 0.15)
 
             twist = Twist(
                 linear=Vector3(x=vel_x, y=vel_y, z=vel_z),
-                angular=Vector3(x=0.0, y=0.0, z=0.0),
+                angular=Vector3(x=float(omega[0]), y=float(omega[1]), z=float(omega[2])),
             )
             move_robot(motion_update=self._make_motion_update(twist))
 
-            dist = float(np.linalg.norm(port_rel_b))
+            dist = float(np.linalg.norm(entrance_pos_b - plug_pos_b))
             self.get_logger().info(
                 f"dist={dist*100:.1f}cm  port_rel={port_rel_b.round(3)}  "
                 f"eef_b={plug_pos_b.round(3)}  "
