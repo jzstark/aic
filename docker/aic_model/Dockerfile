@@ -20,6 +20,11 @@ SHELL ["/bin/bash", "-c"]
 RUN --mount=type=cache,target=/root/.cache/rattler/cache --mount=type=cache,target=/ws_aic/src/aic/.pixi/build \
     cd /ws_aic/src/aic && pixi install --locked
 
+# Force-sync my_policy_node source into the pixi-installed site-packages so that
+# the build-cache mount cannot serve a stale version of the package.
+RUN site_pkg=$(find /ws_aic/src/aic/.pixi/envs/default/lib -name site-packages -type d | head -1) && \
+    cp -r /ws_aic/src/aic/my_policy_node/my_policy_node/* "${site_pkg}/my_policy_node/"
+
 WORKDIR /ws_aic/src/aic
 COPY --chmod=755 <<"EOF" /entrypoint.sh
 #!/bin/bash
@@ -60,4 +65,4 @@ EOF
 
 ENTRYPOINT ["/entrypoint.sh"]
 # TODO:update the policy and parameters as needed
-CMD ["--ros-args", "-p", "policy:=my_policy_node.WaveArm", "-p", "use_sim_time:=true"]
+CMD ["--ros-args", "-p", "policy:=my_policy_node.RLPolicy", "-p", "use_sim_time:=true"]
